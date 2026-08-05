@@ -475,7 +475,190 @@ make PLATFORM=nvidia run VERBOSE=true
 
 原因仍是官方 `tester/tester_nv.o` 为 x86-64，而当前机器为 AArch64。不能将本阶段的独立 smoke 结果描述为官方 tester 全量通过。朴素版本的完整正确性检查点已建立，下一阶段会在保留本提交历史的前提下替换为 online-softmax 实现。
 
-## 10. x86-64 环境的官方测试命令
+## 10. 阶段 4：tiled online-softmax Attention 实施记录
+
+实施日期：2026-08-05。
+
+### 10.1 具体实现
+
+`src/kernels.cu` 已将阶段 3 的三 kernel 朴素 Attention 替换为单 kernel 的 tiled online-softmax 实现：
+
+- 一个 CUDA block 处理一个 `(batch, target_position, query_head)` attention row，并通过 grid-stride 覆盖全部 row；
+- source 维度按 `kBlockSize = 256` 分 tile 处理；
+- 每个 tile 中每个线程计算一个 source position 的 scaled QK score；
+- block 内用 FP32 reduction 计算 tile max 和 tile sum；
+- 以 online-softmax 方式维护 `row_max`、`row_sum` 和 FP32 output accumulator；
+- 当新 tile 的最大值改变时，使用 `exp(old_max - new_max)` 重缩放旧 accumulator；
+- causal 模式直接将有效 source 长度限制为 `min(src_seq_len, target_position + 1)`，不计算被 mask 的 key；
+- GQA 映射仍为 `kv_head = query_head / (query_heads / kv_heads)`；
+- 不再分配完整 `[batch_size, target_seq_len, query_heads, src_seq_len]` scores buffer。
+
+该实现使用 dynamic shared memory 存放：
+
+```text
+probabilities: kBlockSize floats
+accumulator:   head_dim floats
+```
+
+Host wrapper 在 launch 前检查所需 shared memory 是否超过 `cudaDevAttrMaxSharedMemoryPerBlock`，若超出则抛出 `Attention head_dim requires too much shared memory`，避免 kernel launch 时才失败。
+
+`Makefile` 已将 NVIDIA 默认优化级别由 `-O0` 调整为：
+
+```make
+CFLAGS := -std=c++17 -O3
+```
+
+没有硬编码当前 GPU 架构，也没有默认启用 `--use_fast_math`。
+
+### 10.2 编译操作
+
+当前 AArch64 环境仍无法链接官方 x86-64 tester，因此首先执行独立对象编译：
+
+```bash
+nvcc -std=c++17 -O3 -DPLATFORM_NVIDIA \
+  -Xcompiler=-Wall,-Wextra \
+  -c src/kernels.cu -o src/kernels.o
+```
+
+结果：编译通过，无错误。
+
+随后验证 Makefile 路径：
+
+```bash
+make clean
+make PLATFORM=nvidia build
+```
+
+实际结果：`src/kernels.cu` 使用 `-O3` 编译成功，但链接阶段仍因官方 tester 架构不匹配失败：
+
+```text
+/usr/bin/ld: tester/tester_nv.o: Relocations in generic ELF (EM: 62)
+/usr/bin/ld: tester/tester_nv.o: error adding symbols: file in wrong format
+collect2: error: ld returned 1 exit status
+make_build_status=2
+```
+
+这与前序阶段的 AArch64 host / x86-64 tester object 不兼容根因一致，不是 online-softmax CUDA 编译错误。
+
+### 10.3 本机 Attention smoke tester
+
+更新 `/tmp/attention_smoke.cu`，在阶段 3 用例基础上补充 `src_seq_len = 300` 的跨 tile 场景，以覆盖不止一个 source tile 的 online-softmax 路径：
+
+```cpp
+pass &= run<float>(1, 2, 300, 2, 1, 11, false, 2e-5f);
+pass &= run<half>(1, 2, 300, 2, 1, 11, false, 5e-3f);
+```
+
+构建和运行：
+
+```bash
+nvcc -std=c++17 -O3 /tmp/attention_smoke.cu src/kernels.o -o /tmp/attention_smoke
+/tmp/attention_smoke
+```
+
+实际输出：
+
+```text
+B=1 T=3 S=5 H=4 HK=2 D=3 causal=0 max_diff=1.19209e-07
+B=2 T=5 S=5 H=4 HK=1 D=7 causal=1 max_diff=1.19209e-07
+B=1 T=4 S=6 H=4 HK=2 D=5 causal=0 max_diff=0.00011611
+B=2 T=6 S=3 H=2 HK=1 D=9 causal=1 max_diff=0.000194967
+B=1 T=2 S=300 H=2 HK=1 D=11 causal=0 max_diff=2.8871e-08
+B=1 T=2 S=300 H=2 HK=1 D=11 causal=0 max_diff=7.57538e-06
+ATTENTION_SMOKE_PASS
+```
+
+float 容差设为 `2e-5`，half 容差设为 `5e-3`，所有用例通过。该 smoke 覆盖了 float、half、causal、non-causal、GQA、`src_seq_len != target_seq_len` 和跨 tile source 序列。
+
+### 10.4 RMSNorm 回归
+
+执行：
+
+```bash
+nvcc -std=c++17 -O3 /tmp/rms_smoke.cu src/kernels.o -o /tmp/rms_smoke
+/tmp/rms_smoke
+```
+
+结果：
+
+```text
+RMS_SMOKE_PASS
+```
+
+online-softmax 修改未破坏 RMSNorm 本机 smoke 回归。
+
+### 10.5 Compute Sanitizer
+
+对更新后的 `/tmp/attention_smoke` 执行：
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode=1 /tmp/attention_smoke
+compute-sanitizer --tool racecheck --error-exitcode=1 /tmp/attention_smoke
+compute-sanitizer --tool initcheck --error-exitcode=1 /tmp/attention_smoke
+```
+
+实际结果：
+
+```text
+ATTENTION_SMOKE_PASS
+========= ERROR SUMMARY: 0 errors
+
+ATTENTION_SMOKE_PASS
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+
+ATTENTION_SMOKE_PASS
+========= ERROR SUMMARY: 0 errors
+```
+
+### 10.6 性能对比
+
+使用同一 AArch64 NVIDIA GB10 环境、同一 `-O3` 编译条件、同一 `/tmp/attention_smoke` 进程级 smoke 程序做粗粒度比较。该计时包含进程启动、CUDA context 初始化、device allocation、H2D/D2H 和全部 smoke case，不代表官方 tester 的单项 kernel 性能。
+
+阶段 3 朴素 Attention 的五轮端到端耗时：
+
+```text
+run=1 elapsed=0.39
+run=2 elapsed=0.34
+run=3 elapsed=0.34
+run=4 elapsed=0.35
+run=5 elapsed=0.34
+```
+
+阶段 4 online-softmax Attention 的五轮端到端耗时：
+
+```text
+run=1 elapsed=0.39
+run=2 elapsed=0.34
+run=3 elapsed=0.35
+run=4 elapsed=0.34
+run=5 elapsed=0.34
+```
+
+两者中位数均约为 `0.34s`。由于 smoke case 很小且端到端开销占主导，当前数据只能说明 online-softmax 版本在该 smoke 程序下没有可见整体退化；不能据此声称官方大尺寸性能提升幅度。
+
+### 10.7 当前验证结论与限制
+
+本阶段已经完成：
+
+- online-softmax Attention 替换朴素完整 scores 版本；
+- 删除完整 scores buffer 分配；
+- dynamic shared memory 容量检查；
+- NVIDIA 默认 `-O3` 编译参数；
+- 本机 float/half、causal/non-causal、GQA、跨 tile Attention smoke；
+- RMSNorm 回归；
+- memcheck、racecheck、initcheck；
+- 与阶段 3 相同 smoke 程序下的五轮粗粒度性能比较。
+
+尚未完成：
+
+```bash
+SKIP_RMS_NORM=1 make PLATFORM=nvidia run VERBOSE=true
+make PLATFORM=nvidia run VERBOSE=true
+```
+
+原因仍是当前 AArch64 主机无法链接仓库提供的 x86-64 `tester/tester_nv.o`。本阶段不能记录为官方 tester 通过；需要后续在 x86-64 Linux + NVIDIA GPU 环境按第 11 节命令补测。
+
+## 11. x86-64 环境的官方测试命令
 
 当前仓库的 `tester/tester_nv.o` 是 x86-64 对象，因此必须在 **x86-64 Linux + NVIDIA GPU** 环境中执行以下命令。不要把当前 AArch64 环境生成的 `src/kernels.o` 或可执行文件复制到 x86-64，也不要把 x86-64 的 `tester_nv.o` 与 AArch64 对象混合链接。
 
