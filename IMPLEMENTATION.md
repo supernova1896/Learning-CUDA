@@ -658,7 +658,82 @@ make PLATFORM=nvidia run VERBOSE=true
 
 原因仍是当前 AArch64 主机无法链接仓库提供的 x86-64 `tester/tester_nv.o`。本阶段不能记录为官方 tester 通过；需要后续在 x86-64 Linux + NVIDIA GPU 环境按第 11 节命令补测。
 
-## 11. x86-64 环境的官方测试命令
+## 11. 阶段 5：最终验证与文档封板
+
+实施日期：2026-08-05。
+
+### 11.1 最终验证范围
+
+本阶段在阶段 4 完成并提交后，针对当前 AArch64 NVIDIA GB10 环境执行了可行的最终复核：
+
+- `src/kernels.cu` 的独立编译；
+- RMSNorm smoke；
+- Attention smoke（含跨 tile source 长度）；
+- `compute-sanitizer` 的 `memcheck`、`racecheck`、`initcheck`；
+- `Makefile` 的 NVIDIA 官方构建路径；
+- `git diff --check`。
+
+### 11.2 实际结果
+
+独立编译与 smoke 结果保持通过：
+
+```bash
+nvcc -std=c++17 -O3 -DPLATFORM_NVIDIA -Xcompiler=-Wall,-Wextra -c src/kernels.cu -o src/kernels.o
+nvcc -std=c++17 -O3 /tmp/rms_smoke.cu src/kernels.o -o /tmp/rms_smoke
+/tmp/rms_smoke
+nvcc -std=c++17 -O3 /tmp/attention_smoke.cu src/kernels.o -o /tmp/attention_smoke
+/tmp/attention_smoke
+```
+
+对应输出仍为：
+
+```text
+RMS_SMOKE_PASS
+ATTENTION_SMOKE_PASS
+```
+
+sanitizer 复核结果仍为零错误、零 hazard：
+
+```text
+========= ERROR SUMMARY: 0 errors
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+```
+
+`git diff --check` 无输出，说明当前变更没有空白格式问题。
+
+### 11.3 官方 tester 阻塞复核
+
+再次执行 NVIDIA 官方构建路径：
+
+```bash
+make clean
+make PLATFORM=nvidia build
+```
+
+结果仍然在链接阶段失败，原因与前文一致：当前主机是 AArch64，而仓库中的 `tester/tester_nv.o` 是 x86-64 对象，不能与当前构建的 host object 混合链接：
+
+```text
+/usr/bin/ld: tester/tester_nv.o: Relocations in generic ELF (EM: 62)
+/usr/bin/ld: tester/tester_nv.o: error adding symbols: file in wrong format
+collect2: error: ld returned 1 exit status
+make: *** [Makefile:98：test_kernels] 错误 1
+make_build_status=2
+```
+
+因此当前环境下仍不能把官方 tester 的全量通过写成事实；需要后续在 x86-64 Linux + NVIDIA GPU 环境执行第 12 节命令。
+
+### 11.4 最终结论
+
+截至本阶段：
+
+- RMSNorm 已完成实现并在本机验证通过；
+- Attention 已完成朴素正确性实现与 tiled online-softmax 优化，并在本机验证通过；
+- 在线版本未再分配完整 scores buffer；
+- `Makefile` 默认 NVIDIA 优化级别已提升为 `-O3`；
+- sanitizer 未报告真实错误；
+- 当前唯一未解除的阻塞仍是官方 x86-64 tester 与本机 AArch64 host 的 ABI/ISA 不兼容。
+
+## 12. x86-64 环境的官方测试命令
 
 当前仓库的 `tester/tester_nv.o` 是 x86-64 对象，因此必须在 **x86-64 Linux + NVIDIA GPU** 环境中执行以下命令。不要把当前 AArch64 环境生成的 `src/kernels.o` 或可执行文件复制到 x86-64，也不要把 x86-64 的 `tester_nv.o` 与 AArch64 对象混合链接。
 
