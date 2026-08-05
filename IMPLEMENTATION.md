@@ -212,9 +212,269 @@ tester/tester_nv.o: ELF 64-bit LSB relocatable, x86-64
 - 完整回归破坏之前已通过的算子；
 - 文档记录与真实命令输出不一致。
 
-当前阶段 1 已完成仓库分析和阻塞诊断，但 NVIDIA tester 的 AArch64 兼容对象尚未提供，因此功能阶段仍处于验证前阻塞状态。
+当前阶段 1 已完成仓库分析和阻塞诊断，但 NVIDIA tester 的 AArch64 兼容对象尚未提供，因此官方功能测试仍处于验证前阻塞状态。
 
-## 8. 提交与产物规则
+## 8. 阶段 2：RMSNorm 实施记录
+
+实施日期：2026-08-05。
+
+### 8.1 具体实现
+
+`src/kernels.cu` 已完成 NVIDIA RMSNorm：
+
+- 固定使用 256 threads/block，一个 block 处理一行，并以 grid-stride 支持超过 65535 行；
+- 每个线程跨步处理隐藏维度，不要求 `hidden_dim` 是 2 的幂或 block 大小的倍数；
+- `float` 和 `half` 均转换为 FP32 计算平方和、均值及归一化；
+- warp 内使用 `__shfl_down_sync` 归约，warp 间使用 shared memory 归约；
+- block 共享 `inv_rms`，再将归一化结果乘权重并转换回目标类型；
+- Host wrapper 检查空维度、`rows * hidden_dim` 溢出及输入尺寸，管理 H2D/D2H 和 device buffer；
+- CUDA API、kernel launch 和同步 D2H 拷贝均使用 `RUNTIME_CHECK` 检查。
+
+实现没有使用 CUB、Thrust、cuDNN 或其他库函数完成关键计算。
+
+### 8.2 编译操作
+
+由于官方 `tester_nv.o` 仍为 x86-64，本阶段先对 AArch64 CUDA 对象做独立编译：
+
+```bash
+make clean
+nvcc -std=c++17 -O3 -DPLATFORM_NVIDIA \
+  -Xcompiler=-Wall,-Wextra \
+  -c src/kernels.cu -o src/kernels.o
+```
+
+结果：RMSNorm 代码编译成功。编译器只报告尚未实施的 `flashAttention` 参数未使用警告，没有 RMSNorm 编译警告或错误。
+
+### 8.3 本机 smoke tester
+
+为在当前 AArch64 GPU 环境验证计算结果，在 `/tmp/rms_smoke.cu` 编写了不纳入仓库的独立测试程序。该程序：
+
+1. 生成确定性的 input 和 weight；
+2. 调用仓库中的 `rmsNorm<float>` 或 `rmsNorm<half>`；
+3. 在 Host 端以 FP32 公式计算独立 reference；
+4. 逐元素计算最大绝对误差；
+5. 覆盖非 2 的幂、跨 warp、跨 block 步进和超出 grid 上限的行数。
+
+构建和运行命令：
+
+```bash
+nvcc -std=c++17 -O3 /tmp/rms_smoke.cu src/kernels.o -o /tmp/rms_smoke
+/tmp/rms_smoke
+```
+
+实际结果：
+
+| 类型 | rows | hidden_dim | 最大绝对误差 |
+| --- | ---: | ---: | ---: |
+| float | 5 | 1 | 2.98023e-08 |
+| half | 5 | 1 | 1.63913e-06 |
+| float | 5 | 3 | 5.96046e-08 |
+| half | 5 | 3 | 1.96099e-04 |
+| float | 5 | 33 | 5.96046e-08 |
+| half | 5 | 33 | 9.63211e-04 |
+| float | 5 | 257 | 1.19209e-07 |
+| half | 5 | 257 | 9.60588e-04 |
+| float | 5 | 4096 | 2.08616e-07 |
+| half | 5 | 4096 | 9.29117e-04 |
+| float | 65537 | 1 | 2.98023e-08 |
+
+测试最终输出：
+
+```text
+RMS_SMOKE_PASS
+```
+
+float 容差设为 `2e-5`，half 容差设为 `2e-3`，所有用例均通过。
+
+### 8.4 Compute Sanitizer
+
+执行：
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode=1 /tmp/rms_smoke
+compute-sanitizer --tool racecheck --error-exitcode=1 /tmp/rms_smoke
+```
+
+实际结果：
+
+```text
+RMS_SMOKE_PASS
+========= ERROR SUMMARY: 0 errors
+
+RMS_SMOKE_PASS
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+```
+
+### 8.5 独立代码审查
+
+对归约、同步、half 数值路径、Host 尺寸处理和平台假设进行了独立审查。审查未发现计算正确性的阻塞问题，并确认：
+
+- 当前固定 256-thread launch 下，两级归约覆盖 8 个 warp；
+- grid-stride 每轮的共享状态由完整 block 同步隔离；
+- half 在 FP32 中累加并在输出时转换；
+- 后续补充了 `rows * hidden_dim` 的 `size_t` 溢出检查；
+- warp size 32 和 `__shfl_down_sync` 是 NVIDIA 路径已验证的假设，Iluvatar 仍需对应工具链和硬件验证。
+
+### 8.6 当前验证结论与阻塞
+
+本阶段已经完成：
+
+- AArch64 CUDA 13.0 编译；
+- 自建 reference 的 float/half 正确性验证；
+- 非 2 的幂和大隐藏维度验证；
+- `rows > 65535` 的 grid-stride 验证；
+- memcheck 和 racecheck。
+
+尚未完成：
+
+```bash
+SKIP_ATTENTION=1 make PLATFORM=nvidia run VERBOSE=true
+```
+
+原因仍是仓库的 `tester/tester_nv.o` 为 x86-64，而当前主机为 AArch64。以上结果证明本机测试覆盖内的实现正确且无 sanitizer 报错，但不能替代官方 tester 的尺寸表和容差。阶段 2 在获得 AArch64 tester 或 x86-64 NVIDIA 运行环境前不标记为“官方验证完成”。
+
+
+## 9. x86-64 环境的官方测试命令
+
+当前仓库的 `tester/tester_nv.o` 是 x86-64 对象，因此必须在 **x86-64 Linux + NVIDIA GPU** 环境中执行以下命令。不要把当前 AArch64 环境生成的 `src/kernels.o` 或可执行文件复制到 x86-64，也不要把 x86-64 的 `tester_nv.o` 与 AArch64 对象混合链接。
+
+### 9.1 环境检查
+
+```bash
+uname -m
+file tester/tester_nv.o
+nvcc --version
+nvidia-smi
+```
+
+期望至少满足：
+
+```text
+uname -m                         -> x86_64
+tester/tester_nv.o               -> ELF 64-bit LSB relocatable, x86-64
+```
+
+确认工作目录是仓库根目录，并确保使用当前仓库中的测试对象：
+
+```bash
+pwd
+ls -l tester/tester_nv.o src/kernels.cu Makefile
+```
+
+### 9.2 构建
+
+先清理其他平台或旧架构产生的构建产物，再构建 NVIDIA 版本：
+
+```bash
+make clean
+make PLATFORM=nvidia build
+```
+
+如需查看详细编译命令：
+
+```bash
+make clean
+make PLATFORM=nvidia VERBOSE=true build
+```
+
+### 9.3 RMSNorm 分项测试
+
+```bash
+SKIP_ATTENTION=1 make PLATFORM=nvidia run VERBOSE=true
+```
+
+或直接运行已经构建的测试器：
+
+```bash
+SKIP_ATTENTION=1 ./test_kernels --verbose
+```
+
+确认输出中的 RMSNorm 测试全部通过后，将实际输出中的测试数量、误差和耗时追加到本文件的“阶段 2：RMSNorm 实施记录”中。若测试失败，应保留失败用例、`Max Diff`、`Max Tolerance` 和完整命令，不要记录为通过。
+
+### 9.4 Flash Attention 分项测试
+
+当前阶段 3 或阶段 4 实现完成后运行：
+
+```bash
+SKIP_RMS_NORM=1 make PLATFORM=nvidia run VERBOSE=true
+```
+
+或：
+
+```bash
+SKIP_RMS_NORM=1 ./test_kernels --verbose
+```
+
+应确认 `float`、`half`、causal、non-causal 和 GQA 用例均通过。
+
+### 9.5 完整回归测试
+
+```bash
+make PLATFORM=nvidia run VERBOSE=true
+```
+
+该命令同时运行 RMSNorm 和 Flash Attention。每次修改 kernel 后都应先执行：
+
+```bash
+make clean
+make PLATFORM=nvidia build
+```
+
+避免旧的 `src/kernels.o` 影响结果。
+
+### 9.6 NVIDIA Compute Sanitizer
+
+在 x86-64 环境中，先完成普通测试，再运行 sanitizer：
+
+```bash
+compute-sanitizer --tool memcheck \
+  --error-exitcode=1 \
+  ./test_kernels --verbose
+
+compute-sanitizer --tool racecheck \
+  --error-exitcode=1 \
+  ./test_kernels --verbose
+
+compute-sanitizer --tool initcheck \
+  --error-exitcode=1 \
+  ./test_kernels --verbose
+```
+
+也可以只检查某个算子：
+
+```bash
+SKIP_ATTENTION=1 compute-sanitizer --tool memcheck \
+  --error-exitcode=1 ./test_kernels --verbose
+
+SKIP_RMS_NORM=1 compute-sanitizer --tool memcheck \
+  --error-exitcode=1 ./test_kernels --verbose
+```
+
+判定标准：`memcheck` 不得报告非法访问，`racecheck` 不得报告真实竞争，`initcheck` 不得报告未初始化读取。sanitizer 运行时间通常明显长于普通测试，不应将其耗时用于性能比较。
+
+### 9.7 性能记录
+
+朴素 Attention 和 online-softmax Attention 必须使用相同的硬件、CUDA 版本、编译参数、测试对象和运行方式进行比较。建议先使用优化构建：
+
+```bash
+make clean
+make PLATFORM=nvidia CFLAGS="-std=c++17 -O3" build
+```
+
+然后至少执行五次：
+
+```bash
+for run in 1 2 3 4 5; do
+  echo "=== performance run ${run} ==="
+  make PLATFORM=nvidia run VERBOSE=true
+ done
+```
+
+记录 warm-up 规则、tester 输出的耗时、运行次数和中位数；不要使用 sanitizer 的耗时作为性能结果。若 tester 只输出聚合耗时，应明确注明无法从公开输出还原单个 shape 的独立耗时。
+
+
+
+## 10. 提交与产物规则
 
 每个阶段都应在本文件中追加：
 
