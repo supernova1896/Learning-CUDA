@@ -334,11 +334,152 @@ SKIP_ATTENTION=1 make PLATFORM=nvidia run VERBOSE=true
 原因仍是仓库的 `tester/tester_nv.o` 为 x86-64，而当前主机为 AArch64。以上结果证明本机测试覆盖内的实现正确且无 sanitizer 报错，但不能替代官方 tester 的尺寸表和容差。阶段 2 在获得 AArch64 tester 或 x86-64 NVIDIA 运行环境前不标记为“官方验证完成”。
 
 
-## 9. x86-64 环境的官方测试命令
+## 9. 阶段 3：朴素 Attention 实施记录
+
+实施日期：2026-08-05。
+
+### 9.1 具体实现
+
+`src/kernels.cu` 已加入一个以正确性为目标的三阶段 GPU Attention 实现：
+
+1. `attentionScoreKernel`：按 `[B,T,Hq,D]`、`[B,S,Hkv,D]` 布局计算 scaled QK，并将完整 FP32 scores 写入 device buffer；
+2. `attentionSoftmaxKernel`：每个 `(batch, target_position, query_head)` 行使用 block reduction 求最大值，减最大值后计算并归一化 softmax；
+3. `attentionOutputKernel`：按 PV 公式计算输出，FP32 累加后转换为 `float` 或 `half`。
+
+GQA 使用：
+
+```text
+kv_head = query_head / (query_heads / kv_heads)
+```
+
+causal mask 使用 PyTorch SDPA 对应的左上对齐语义：
+
+```text
+source_position <= target_position
+```
+
+因此 `src_seq_len != target_seq_len` 时仍按接口的左上对角线处理，不采用 KV-cache 场景下的右移 offset。
+
+Host wrapper 增加了正数维度检查、GQA 整除检查、输入大小检查和多重 `size_t` 元素/字节大小溢出检查。主计算没有使用 cuBLAS、cuDNN、CUB、Thrust 或现成 Attention 库。
+
+该版本会物化完整的 `[B,T,Hq,S]` FP32 scores，仅作为可审查的正确性检查点，不作为最终性能实现；下一阶段将替换为 tiled online-softmax。
+
+### 9.2 本机 Attention smoke tester
+
+由于官方 `tester/tester_nv.o` 仍为 x86-64，当前 AArch64 环境使用 `/tmp/attention_smoke.cu` 进行独立 reference 验证。测试程序覆盖：
+
+- `float` 和 `half`；
+- causal 和 non-causal；
+- GQA（`Hq > Hkv`）；
+- `src_seq_len > target_seq_len` 和 `src_seq_len < target_seq_len`；
+- 不同的 `head_dim`。
+
+构建和运行：
+
+```bash
+nvcc -std=c++17 -O3 /tmp/attention_smoke.cu src/kernels.o -o /tmp/attention_smoke
+/tmp/attention_smoke
+```
+
+实际输出：
+
+```text
+B=1 T=3 S=5 H=4 HK=2 D=3 causal=0 max_diff=5.96046e-08
+B=2 T=5 S=5 H=4 HK=1 D=7 causal=1 max_diff=1.19209e-07
+B=1 T=4 S=6 H=4 HK=2 D=5 causal=0 max_diff=0.00011611
+B=2 T=6 S=3 H=2 HK=1 D=9 causal=1 max_diff=0.000194967
+ATTENTION_SMOKE_PASS
+```
+
+float 容差设为 `2e-5`，half 容差设为 `5e-3`，所有用例通过。
+
+### 9.3 调试过程记录
+
+首次 smoke 运行发现 causal case 的输出误差约为 `1.53` 和 `1.34`。原因是 masked score 使用了错误符号，实际写入了正无穷量级而不是负无穷量级。修正为负的最大 FP32 值后，四组 case 全部通过。该过程确认 smoke reference 能覆盖并捕获 causal mask 的实现错误。
+
+随后补充了 `size_t` 乘法和字节大小溢出检查，并修正了 Attention kernel 插入后文档注释边界。修正后的 NVIDIA CUDA 编译成功。
+
+### 9.4 Compute Sanitizer
+
+执行：
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode=1 /tmp/attention_smoke
+compute-sanitizer --tool racecheck --error-exitcode=1 /tmp/attention_smoke
+compute-sanitizer --tool initcheck --error-exitcode=1 /tmp/attention_smoke
+```
+
+实际结果：
+
+```text
+ATTENTION_SMOKE_PASS
+========= ERROR SUMMARY: 0 errors
+
+ATTENTION_SMOKE_PASS
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+
+ATTENTION_SMOKE_PASS
+========= ERROR SUMMARY: 0 errors
+```
+
+RMSNorm 回归命令：
+
+```bash
+nvcc -std=c++17 -O3 /tmp/rms_smoke.cu src/kernels.o -o /tmp/rms_smoke
+/tmp/rms_smoke
+```
+
+结果：`RMS_SMOKE_PASS`。
+
+### 9.5 性能基线
+
+使用与正确性 smoke 相同的 `/tmp/attention_smoke`，每轮启动独立进程并包含 CUDA context 初始化，执行五轮：
+
+```bash
+for run in 1 2 3 4 5; do
+  /usr/bin/time -f "run=$run elapsed=%e" /tmp/attention_smoke
+ done
+```
+
+实际端到端耗时：
+
+```text
+run=1 elapsed=0.39
+run=2 elapsed=0.34
+run=3 elapsed=0.34
+run=4 elapsed=0.35
+run=5 elapsed=0.34
+```
+
+范围为 `0.34–0.39s`，中位数约 `0.34s`。该数据包含进程启动、CUDA context、device allocation、H2D/D2H 和四组 smoke case，只能作为同一测试程序下 online-softmax 版本的粗粒度比较，不能代表官方 tester 的单项性能排名。
+
+### 9.6 当前验证结论与限制
+
+本阶段已经完成：
+
+- NVIDIA CUDA 13.0 编译；
+- float/half 正确性 smoke；
+- causal/non-causal smoke；
+- GQA smoke；
+- 非相等 source/target 长度 smoke；
+- RMSNorm 回归；
+- memcheck、racecheck、initcheck；
+- 五轮粗粒度性能基线。
+
+尚未完成：
+
+```bash
+SKIP_RMS_NORM=1 make PLATFORM=nvidia run VERBOSE=true
+make PLATFORM=nvidia run VERBOSE=true
+```
+
+原因仍是官方 `tester/tester_nv.o` 为 x86-64，而当前机器为 AArch64。不能将本阶段的独立 smoke 结果描述为官方 tester 全量通过。朴素版本的完整正确性检查点已建立，下一阶段会在保留本提交历史的前提下替换为 online-softmax 实现。
+
+## 10. x86-64 环境的官方测试命令
 
 当前仓库的 `tester/tester_nv.o` 是 x86-64 对象，因此必须在 **x86-64 Linux + NVIDIA GPU** 环境中执行以下命令。不要把当前 AArch64 环境生成的 `src/kernels.o` 或可执行文件复制到 x86-64，也不要把 x86-64 的 `tester_nv.o` 与 AArch64 对象混合链接。
 
-### 9.1 环境检查
+### 10.1 环境检查
 
 ```bash
 uname -m
@@ -361,7 +502,7 @@ pwd
 ls -l tester/tester_nv.o src/kernels.cu Makefile
 ```
 
-### 9.2 构建
+### 10.2 构建
 
 先清理其他平台或旧架构产生的构建产物，再构建 NVIDIA 版本：
 
@@ -377,7 +518,7 @@ make clean
 make PLATFORM=nvidia VERBOSE=true build
 ```
 
-### 9.3 RMSNorm 分项测试
+### 10.3 RMSNorm 分项测试
 
 ```bash
 SKIP_ATTENTION=1 make PLATFORM=nvidia run VERBOSE=true
@@ -391,7 +532,7 @@ SKIP_ATTENTION=1 ./test_kernels --verbose
 
 确认输出中的 RMSNorm 测试全部通过后，将实际输出中的测试数量、误差和耗时追加到本文件的“阶段 2：RMSNorm 实施记录”中。若测试失败，应保留失败用例、`Max Diff`、`Max Tolerance` 和完整命令，不要记录为通过。
 
-### 9.4 Flash Attention 分项测试
+### 10.4 Flash Attention 分项测试
 
 当前阶段 3 或阶段 4 实现完成后运行：
 
@@ -407,7 +548,7 @@ SKIP_RMS_NORM=1 ./test_kernels --verbose
 
 应确认 `float`、`half`、causal、non-causal 和 GQA 用例均通过。
 
-### 9.5 完整回归测试
+### 10.5 完整回归测试
 
 ```bash
 make PLATFORM=nvidia run VERBOSE=true
@@ -422,7 +563,7 @@ make PLATFORM=nvidia build
 
 避免旧的 `src/kernels.o` 影响结果。
 
-### 9.6 NVIDIA Compute Sanitizer
+### 10.6 NVIDIA Compute Sanitizer
 
 在 x86-64 环境中，先完成普通测试，再运行 sanitizer：
 
@@ -452,7 +593,7 @@ SKIP_RMS_NORM=1 compute-sanitizer --tool memcheck \
 
 判定标准：`memcheck` 不得报告非法访问，`racecheck` 不得报告真实竞争，`initcheck` 不得报告未初始化读取。sanitizer 运行时间通常明显长于普通测试，不应将其耗时用于性能比较。
 
-### 9.7 性能记录
+### 10.7 性能记录
 
 朴素 Attention 和 online-softmax Attention 必须使用相同的硬件、CUDA 版本、编译参数、测试对象和运行方式进行比较。建议先使用优化构建：
 
@@ -474,7 +615,7 @@ for run in 1 2 3 4 5; do
 
 
 
-## 10. 提交与产物规则
+## 11. 提交与产物规则
 
 每个阶段都应在本文件中追加：
 

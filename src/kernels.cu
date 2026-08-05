@@ -10,6 +10,14 @@ namespace {
 
 constexpr int kBlockSize = 256;
 constexpr int kWarpSize = 32;
+constexpr float kMaxFloat = 3.402823466e+38F;
+
+size_t checkedMultiply(size_t left, size_t right, const char* message) {
+  if (right != 0 && left > std::numeric_limits<size_t>::max() / right) {
+    throw std::invalid_argument(message);
+  }
+  return left * right;
+}
 
 template <typename T>
 __device__ float toFloat(T value) {
@@ -84,6 +92,142 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
     }
     __syncthreads();
   }
+}
+
+template <typename T>
+__global__ void attentionScoreKernel(const T* q, const T* k, float* scores,
+                                     int batch_size, int target_seq_len,
+                                     int src_seq_len, int query_heads,
+                                     int kv_heads, int head_dim,
+                                     bool is_causal) {
+  const size_t total_scores = static_cast<size_t>(batch_size) * target_seq_len *
+                              query_heads * src_seq_len;
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < total_scores; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    size_t remaining = index;
+    const int source_position = remaining % src_seq_len;
+    remaining /= src_seq_len;
+    const int query_head = remaining % query_heads;
+    remaining /= query_heads;
+    const int target_position = remaining % target_seq_len;
+    const int batch = remaining / target_seq_len;
+
+    float score = -kMaxFloat;
+    if (!is_causal || source_position <= target_position) {
+      const int group_size = query_heads / kv_heads;
+      const int kv_head = query_head / group_size;
+      const size_t q_offset =
+          ((static_cast<size_t>(batch) * target_seq_len + target_position) *
+               query_heads + query_head) *
+          head_dim;
+      const size_t k_offset =
+          ((static_cast<size_t>(batch) * src_seq_len + source_position) *
+               kv_heads + kv_head) *
+          head_dim;
+      float dot = 0.0f;
+      for (int dimension = 0; dimension < head_dim; ++dimension) {
+        dot += toFloat(q[q_offset + dimension]) *
+               toFloat(k[k_offset + dimension]);
+      }
+      score = dot / sqrtf(static_cast<float>(head_dim));
+    }
+    scores[index] = score;
+  }
+}
+
+__device__ float blockReduceMax(float value);
+
+__global__ void attentionSoftmaxKernel(float* scores, int batch_size,
+                                       int target_seq_len, int src_seq_len,
+                                       int query_heads) {
+  const size_t rows = static_cast<size_t>(batch_size) * target_seq_len * query_heads;
+  for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+    const size_t offset = row * src_seq_len;
+    float maximum = -kMaxFloat;
+    for (int source_position = threadIdx.x; source_position < src_seq_len;
+         source_position += blockDim.x) {
+      maximum = fmaxf(maximum, scores[offset + source_position]);
+    }
+    maximum = blockReduceMax(maximum);
+    __shared__ float row_max;
+    __shared__ float row_sum;
+    if (threadIdx.x == 0) {
+      row_max = maximum;
+    }
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int source_position = threadIdx.x; source_position < src_seq_len;
+         source_position += blockDim.x) {
+      const float probability = expf(scores[offset + source_position] - row_max);
+      scores[offset + source_position] = probability;
+      sum += probability;
+    }
+    sum = blockReduceSum(sum);
+    if (threadIdx.x == 0) {
+      row_sum = sum;
+    }
+    __syncthreads();
+    for (int source_position = threadIdx.x; source_position < src_seq_len;
+         source_position += blockDim.x) {
+      scores[offset + source_position] /= row_sum;
+    }
+    __syncthreads();
+  }
+}
+
+template <typename T>
+__global__ void attentionOutputKernel(const float* scores, const T* v, T* output,
+                                      int batch_size, int target_seq_len,
+                                      int src_seq_len, int query_heads,
+                                      int kv_heads, int head_dim) {
+  const size_t total_outputs = static_cast<size_t>(batch_size) * target_seq_len *
+                               query_heads * head_dim;
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < total_outputs; index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    size_t remaining = index;
+    const int dimension = remaining % head_dim;
+    remaining /= head_dim;
+    const int query_head = remaining % query_heads;
+    remaining /= query_heads;
+    const int target_position = remaining % target_seq_len;
+    const int batch = remaining / target_seq_len;
+    const int group_size = query_heads / kv_heads;
+    const int kv_head = query_head / group_size;
+
+    float value = 0.0f;
+    for (int source_position = 0; source_position < src_seq_len; ++source_position) {
+      const size_t score_index =
+          (((static_cast<size_t>(batch) * target_seq_len + target_position) *
+             query_heads + query_head) * src_seq_len) + source_position;
+      const size_t v_offset =
+          ((static_cast<size_t>(batch) * src_seq_len + source_position) * kv_heads +
+           kv_head) * head_dim + dimension;
+      value += scores[score_index] * toFloat(v[v_offset]);
+    }
+    output[index] = fromFloat<T>(value);
+  }
+}
+
+__device__ float blockReduceMax(float value) {
+  __shared__ float warp_maxima[kBlockSize / kWarpSize];
+
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+  }
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  if (lane == 0) {
+    warp_maxima[warp] = value;
+  }
+  __syncthreads();
+  value = threadIdx.x < blockDim.x / kWarpSize ? warp_maxima[lane] : -kMaxFloat;
+  if (warp == 0) {
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
+    }
+  }
+  return value;
 }
 
 }  // namespace
@@ -169,9 +313,87 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {
+  if (batch_size <= 0 || target_seq_len <= 0 || src_seq_len <= 0 ||
+      query_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      query_heads % kv_heads != 0) {
+    throw std::invalid_argument("Invalid attention dimensions");
+  }
+
+  const size_t batch = static_cast<size_t>(batch_size);
+  const size_t q_elements = checkedMultiply(
+      checkedMultiply(checkedMultiply(batch, target_seq_len,
+                                      "Attention tensor size overflow"),
+                      query_heads, "Attention tensor size overflow"),
+      head_dim, "Attention tensor size overflow");
+  const size_t kv_elements = checkedMultiply(
+      checkedMultiply(checkedMultiply(batch, src_seq_len,
+                                      "Attention tensor size overflow"),
+                      kv_heads, "Attention tensor size overflow"),
+      head_dim, "Attention tensor size overflow");
+  const size_t score_elements = checkedMultiply(
+      checkedMultiply(checkedMultiply(batch, target_seq_len,
+                                      "Attention score size overflow"),
+                      query_heads, "Attention score size overflow"),
+      src_seq_len, "Attention score size overflow");
+  if (h_q.size() != q_elements || h_k.size() != kv_elements ||
+      h_v.size() != kv_elements) {
+    throw std::invalid_argument("Attention input size mismatch");
+  }
+
+  h_o.resize(q_elements);
+  T* d_q = nullptr;
+  T* d_k = nullptr;
+  T* d_v = nullptr;
+  T* d_o = nullptr;
+  float* d_scores = nullptr;
+  const size_t q_bytes = checkedMultiply(q_elements, sizeof(T),
+                                         "Attention byte size overflow");
+  const size_t kv_bytes = checkedMultiply(kv_elements, sizeof(T),
+                                          "Attention byte size overflow");
+  const size_t output_bytes = q_bytes;
+  const size_t score_bytes = checkedMultiply(score_elements, sizeof(float),
+                                             "Attention score byte size overflow");
+
+  RUNTIME_CHECK(cudaMalloc(&d_q, q_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_k, kv_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_v, kv_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_o, output_bytes));
+  RUNTIME_CHECK(cudaMalloc(&d_scores, score_bytes));
+  RUNTIME_CHECK(cudaMemcpy(d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_k, h_k.data(), kv_bytes, cudaMemcpyHostToDevice));
+  RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), kv_bytes, cudaMemcpyHostToDevice));
+
+  const size_t score_blocks_needed =
+      (score_elements + kBlockSize - 1) / kBlockSize;
+  const int score_blocks = static_cast<int>(std::min<size_t>(score_blocks_needed, 65535));
+  attentionScoreKernel<<<score_blocks, kBlockSize>>>(
+      d_q, d_k, d_scores, batch_size, target_seq_len, src_seq_len,
+      query_heads, kv_heads, head_dim, is_causal);
+  RUNTIME_CHECK(cudaGetLastError());
+
+  const size_t row_count = static_cast<size_t>(batch_size) * target_seq_len * query_heads;
+  const int softmax_blocks = static_cast<int>(std::min<size_t>(row_count, 65535));
+  attentionSoftmaxKernel<<<softmax_blocks, kBlockSize>>>(
+      d_scores, batch_size, target_seq_len, src_seq_len, query_heads);
+  RUNTIME_CHECK(cudaGetLastError());
+
+  const size_t output_blocks_needed =
+      (q_elements + kBlockSize - 1) / kBlockSize;
+  const int output_blocks = static_cast<int>(std::min<size_t>(output_blocks_needed, 65535));
+  attentionOutputKernel<<<output_blocks, kBlockSize>>>(
+      d_scores, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+      query_heads, kv_heads, head_dim);
+  RUNTIME_CHECK(cudaGetLastError());
+  RUNTIME_CHECK(cudaMemcpy(h_o.data(), d_o, output_bytes,
+                           cudaMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(cudaFree(d_scores));
+  RUNTIME_CHECK(cudaFree(d_o));
+  RUNTIME_CHECK(cudaFree(d_v));
+  RUNTIME_CHECK(cudaFree(d_k));
+  RUNTIME_CHECK(cudaFree(d_q));
 }
 
 // *********************************************************************
