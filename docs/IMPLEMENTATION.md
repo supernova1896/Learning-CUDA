@@ -692,11 +692,12 @@ RMS_SMOKE_PASS
 ATTENTION_SMOKE_PASS
 ```
 
-sanitizer 复核结果仍为零错误、零 hazard：
+sanitizer 复核结果为零错误、零 hazard：
 
 ```text
 ========= ERROR SUMMARY: 0 errors
 ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
+========= ERROR SUMMARY: 0 errors
 ```
 
 `git diff --check` 无输出，说明当前变更没有空白格式问题。
@@ -710,7 +711,7 @@ make clean
 make PLATFORM=nvidia build
 ```
 
-结果仍然在链接阶段失败，原因与前文一致：当前主机是 AArch64，而仓库中的 `tester/tester_nv.o` 是 x86-64 对象，不能与当前构建的 host object 混合链接：
+结果在当前 AArch64 主机上仍然失败，原因与前文一致：仓库中的 `tester/tester_nv.o` 是 x86-64 对象，而当前构建产物是 AArch64 host object，不能混合链接：
 
 ```text
 /usr/bin/ld: tester/tester_nv.o: Relocations in generic ELF (EM: 62)
@@ -720,24 +721,24 @@ make: *** [Makefile:98：test_kernels] 错误 1
 make_build_status=2
 ```
 
-因此当前环境下仍不能把官方 tester 的全量通过写成事实；需要后续在 x86-64 Linux + NVIDIA GPU 环境执行第 12 节命令。
-
 ### 11.4 最终结论
 
 截至本阶段：
 
 - RMSNorm 已完成实现并在本机验证通过；
 - Attention 已完成朴素正确性实现与 tiled online-softmax 优化，并在本机验证通过；
-- 在线版本未再分配完整 scores buffer；
+- online-softmax 版本已在远程 RTX4090 官方 tester 上完成全量验证，之前 Attention float 第 `#6` 和 `#14` 的边界失败已经消除；
+- 关键修复是将 `float` 路径的 scale 计算改为 `inv_scale = static_cast<float>(1.0 / sqrt(static_cast<double>(head_dim)));`，与 tester CPU reference 对齐；
+- online version 未再分配完整 scores buffer；
 - `Makefile` 默认 NVIDIA 优化级别已提升为 `-O3`；
 - sanitizer 未报告真实错误；
-- 当前唯一未解除的阻塞仍是官方 x86-64 tester 与本机 AArch64 host 的 ABI/ISA 不兼容。
+- 当前本机 AArch64 host 与 x86-64 tester 的 ABI/ISA 不兼容仍然存在，但不影响远程官方验证结论。
 
 ## 12. x86-64 环境的官方测试命令
 
 当前仓库的 `tester/tester_nv.o` 是 x86-64 对象，因此必须在 **x86-64 Linux + NVIDIA GPU** 环境中执行以下命令。不要把当前 AArch64 环境生成的 `src/kernels.o` 或可执行文件复制到 x86-64，也不要把 x86-64 的 `tester_nv.o` 与 AArch64 对象混合链接。
 
-### 10.1 环境检查
+### 12.1 环境检查
 
 ```bash
 uname -m
@@ -760,7 +761,7 @@ pwd
 ls -l tester/tester_nv.o src/kernels.cu Makefile
 ```
 
-### 10.2 构建
+### 12.2 构建
 
 先清理其他平台或旧架构产生的构建产物，再构建 NVIDIA 版本：
 
@@ -776,7 +777,7 @@ make clean
 make PLATFORM=nvidia VERBOSE=true build
 ```
 
-### 10.3 RMSNorm 分项测试
+### 12.3 RMSNorm 分项测试
 
 ```bash
 SKIP_ATTENTION=1 make PLATFORM=nvidia run VERBOSE=true
@@ -790,7 +791,7 @@ SKIP_ATTENTION=1 ./test_kernels --verbose
 
 确认输出中的 RMSNorm 测试全部通过后，将实际输出中的测试数量、误差和耗时追加到本文件的“阶段 2：RMSNorm 实施记录”中。若测试失败，应保留失败用例、`Max Diff`、`Max Tolerance` 和完整命令，不要记录为通过。
 
-### 10.4 Flash Attention 分项测试
+### 12.4 Flash Attention 分项测试
 
 当前阶段 3 或阶段 4 实现完成后运行：
 
@@ -806,7 +807,7 @@ SKIP_RMS_NORM=1 ./test_kernels --verbose
 
 应确认 `float`、`half`、causal、non-causal 和 GQA 用例均通过。
 
-### 10.5 完整回归测试
+### 12.5 完整回归测试
 
 ```bash
 make PLATFORM=nvidia run VERBOSE=true
@@ -821,37 +822,29 @@ make PLATFORM=nvidia build
 
 避免旧的 `src/kernels.o` 影响结果。
 
-### 10.6 NVIDIA Compute Sanitizer
+### 12.6 NVIDIA Compute Sanitizer
 
 在 x86-64 环境中，先完成普通测试，再运行 sanitizer：
 
 ```bash
-compute-sanitizer --tool memcheck \
-  --error-exitcode=1 \
-  ./test_kernels --verbose
+compute-sanitizer --tool memcheck   --error-exitcode=1   ./test_kernels --verbose
 
-compute-sanitizer --tool racecheck \
-  --error-exitcode=1 \
-  ./test_kernels --verbose
+compute-sanitizer --tool racecheck   --error-exitcode=1   ./test_kernels --verbose
 
-compute-sanitizer --tool initcheck \
-  --error-exitcode=1 \
-  ./test_kernels --verbose
+compute-sanitizer --tool initcheck   --error-exitcode=1   ./test_kernels --verbose
 ```
 
 也可以只检查某个算子：
 
 ```bash
-SKIP_ATTENTION=1 compute-sanitizer --tool memcheck \
-  --error-exitcode=1 ./test_kernels --verbose
+SKIP_ATTENTION=1 compute-sanitizer --tool memcheck   --error-exitcode=1 ./test_kernels --verbose
 
-SKIP_RMS_NORM=1 compute-sanitizer --tool memcheck \
-  --error-exitcode=1 ./test_kernels --verbose
+SKIP_RMS_NORM=1 compute-sanitizer --tool memcheck   --error-exitcode=1 ./test_kernels --verbose
 ```
 
 判定标准：`memcheck` 不得报告非法访问，`racecheck` 不得报告真实竞争，`initcheck` 不得报告未初始化读取。sanitizer 运行时间通常明显长于普通测试，不应将其耗时用于性能比较。
 
-### 10.7 性能记录
+### 12.7 性能记录
 
 朴素 Attention 和 online-softmax Attention 必须使用相同的硬件、CUDA 版本、编译参数、测试对象和运行方式进行比较。建议先使用优化构建：
 
@@ -866,14 +859,12 @@ make PLATFORM=nvidia CFLAGS="-std=c++17 -O3" build
 for run in 1 2 3 4 5; do
   echo "=== performance run ${run} ==="
   make PLATFORM=nvidia run VERBOSE=true
- done
+done
 ```
 
 记录 warm-up 规则、tester 输出的耗时、运行次数和中位数；不要使用 sanitizer 的耗时作为性能结果。若 tester 只输出聚合耗时，应明确注明无法从公开输出还原单个 shape 的独立耗时。
 
-
-
-## 11. 提交与产物规则
+## 13. 提交与产物规则
 
 每个阶段都应在本文件中追加：
 
