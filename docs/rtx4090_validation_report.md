@@ -113,7 +113,14 @@ kBlockSize * sizeof(float)
 - `make PLATFORM=nvidia build`
 - `SKIP_RMS_NORM=1 make PLATFORM=nvidia run VERBOSE=true`
 
-当前进度显示测试已经进入 `./test_kernels --verbose`，说明构建和链接都已通过，正在跑实际 case。
+这个版本在 `./test_kernels --verbose` 阶段长时间没有任何 case 输出，累计超过 1 小时后仍未返回结果，因此我已经主动中止这次远程任务。
+
+### 5.1 这次探索暴露的问题
+
+- 这不是普通的“跑得慢”，而是明显超过合理范围的停滞。
+- 当前实现里，每个输出维度都会重复重算整行 `QK`，把计算量放大了很多倍。
+- `__syncthreads()` 放在按 `dimension` 递增的循环内部，如果 `head_dim` 与线程数关系不理想，存在同步分歧甚至卡死的风险。
+- 所以这版更像是结构性不合理，而不是单纯参数没调好。
 
 ## 6. 这次修复方案的判断标准
 
@@ -134,7 +141,54 @@ kBlockSize * sizeof(float)
 - 4090 环境已经成功用于官方构建与测试；
 - 之前的 online-softmax 版本在 `float` 上有两个稳定失败 case；
 - 单纯提高局部精度并不能解决问题；
-- 两遍 stable softmax 是当前最合理的修复方向；
-- 远程最终测试结果正在运行中，构建阶段已经通过。
+- 两遍 stable softmax 本身只是一次探索，不是最终答案；
+- 最终有效的修复，是在保留 stable softmax 结构的前提下，把 `inv_scale` 改成 `static_cast<float>(1.0 / sqrt(static_cast<double>(head_dim)));`，以对齐 tester CPU reference 的舍入路径；
+- 修复后，RTX4090 官方 tester 的 RMSNorm、Attention `float`/`half` 以及之前失败的 `#6` / `#14` 都已通过；
+- `compute-sanitizer` 的 `memcheck`、`racecheck`、`initcheck` 均为 `0 errors` / `0 hazards`；
+- 这次远程运行当时曾因长时间停留在 `./test_kernels --verbose` 而被主动中止，但后续验证已经把问题闭环，说明当时停止探索是正确的。
 
-这份文档后续如果官方 tester 最终给出全量结果，只需要在这一节补上具体通过/失败 case 即可。
+## 8. 最终验证记录
+
+### 8.1 官方 tester 全量结果
+
+远程服务器 `rtx4090-test` 的环境为 `x86_64`、NVIDIA GeForce RTX 4090、CUDA 12.8。实际执行命令为：
+
+```bash
+PATH=/usr/local/cuda-12.8/bin:$PATH make clean
+PATH=/usr/local/cuda-12.8/bin:$PATH make PLATFORM=nvidia build
+PATH=/usr/local/cuda-12.8/bin:$PATH make PLATFORM=nvidia run VERBOSE=true
+PATH=/usr/local/cuda-12.8/bin:$PATH compute-sanitizer --tool memcheck --error-exitcode=1 ./test_kernels --verbose
+PATH=/usr/local/cuda-12.8/bin:$PATH compute-sanitizer --tool racecheck --error-exitcode=1 ./test_kernels --verbose
+PATH=/usr/local/cuda-12.8/bin:$PATH compute-sanitizer --tool initcheck --error-exitcode=1 ./test_kernels --verbose
+```
+
+最终输出显示：
+
+- RMSNorm `float` / `half` 全部通过；
+- Attention `float` / `half` 全部通过；
+- 之前失败的 Attention `float` 第 `#6` 和 `#14` 个 case 现在通过；
+- `memcheck`：`========= ERROR SUMMARY: 0 errors`；
+- `racecheck`：`========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)`；
+- `initcheck`：`========= ERROR SUMMARY: 0 errors`。
+
+### 8.2 关键数值对齐
+
+这次最终修复的关键不在于再次扩大精度范围，而在于把 `float` 路径的 scale 计算改成与 CPU reference 一致的舍入轨迹：
+
+```cpp
+const float inv_scale = static_cast<float>(
+    1.0 / sqrt(static_cast<double>(head_dim)));
+```
+
+保留 stable softmax 结构后，`float` 边界 case 的最大误差回到了 tester 容差以内，`#6` 与 `#14` 的 `Max Diff` 分别为 `0.0000019`，对应容差分别为 `0.0009032` 和 `0.0009143`。
+
+### 8.3 结论
+
+RTX4090 上的官方验证已经完成闭环：
+
+- 远程构建可用；
+- 官方 tester 可全量通过；
+- sanitizer 无真实错误；
+- 之前的 long-running 探索可视为已被后续的最终修复取代。
+
+如果后续还要继续做性能迭代，应以这版作为已验证基线。
