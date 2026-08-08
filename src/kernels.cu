@@ -126,8 +126,6 @@ __global__ void attentionOnlineKernel(const T* q, const T* k, const T* v,
   float* accumulator = shared + kBlockSize;
   __shared__ float row_max;
   __shared__ float row_sum;
-  __shared__ float row_alpha;
-  __shared__ float row_new_max;
 
   const size_t rows = static_cast<size_t>(batch_size) * target_seq_len * query_heads;
   for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
@@ -144,21 +142,58 @@ __global__ void attentionOnlineKernel(const T* q, const T* k, const T* v,
         ((static_cast<size_t>(batch) * target_seq_len + target_position) *
              query_heads + query_head) *
         head_dim;
+    const float inv_scale = static_cast<float>(
+        1.0 / sqrt(static_cast<double>(head_dim)));
 
     for (int dimension = threadIdx.x; dimension < head_dim;
          dimension += blockDim.x) {
       accumulator[dimension] = 0.0f;
     }
+    __syncthreads();
+
+    float local_max = -kMaxFloat;
+    for (int source_position = threadIdx.x; source_position < effective_src_len;
+         source_position += blockDim.x) {
+      const size_t k_offset =
+          ((static_cast<size_t>(batch) * src_seq_len + source_position) * kv_heads +
+           kv_head) *
+          head_dim;
+      float dot = 0.0f;
+      for (int dimension = 0; dimension < head_dim; ++dimension) {
+        dot += toFloat(q[q_offset + dimension]) *
+               toFloat(k[k_offset + dimension]);
+      }
+      local_max = fmaxf(local_max, dot * inv_scale);
+    }
+    const float reduced_max = blockReduceMax(local_max);
     if (threadIdx.x == 0) {
-      row_max = -kMaxFloat;
-      row_sum = 0.0f;
+      row_max = reduced_max;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      float sum = 0.0f;
+      for (int source_position = 0; source_position < effective_src_len;
+           ++source_position) {
+        const size_t k_offset =
+            ((static_cast<size_t>(batch) * src_seq_len + source_position) * kv_heads +
+             kv_head) *
+            head_dim;
+        float dot = 0.0f;
+        for (int dimension = 0; dimension < head_dim; ++dimension) {
+          dot += toFloat(q[q_offset + dimension]) *
+                 toFloat(k[k_offset + dimension]);
+        }
+        sum += expf(dot * inv_scale - row_max);
+      }
+      row_sum = sum;
     }
     __syncthreads();
 
     for (int tile_start = 0; tile_start < effective_src_len;
          tile_start += kBlockSize) {
       const int source_position = tile_start + threadIdx.x;
-      float score = -kMaxFloat;
+      float probability = 0.0f;
       if (source_position < effective_src_len) {
         const size_t k_offset =
             ((static_cast<size_t>(batch) * src_seq_len + source_position) *
@@ -169,31 +204,14 @@ __global__ void attentionOnlineKernel(const T* q, const T* k, const T* v,
           dot += toFloat(q[q_offset + dimension]) *
                  toFloat(k[k_offset + dimension]);
         }
-        score = dot / sqrtf(static_cast<float>(head_dim));
-      }
-
-      const float tile_max = blockReduceMax(score);
-      if (threadIdx.x == 0) {
-        row_new_max = fmaxf(row_max, tile_max);
-        row_alpha = row_sum == 0.0f ? 0.0f : expf(row_max - row_new_max);
-      }
-      __syncthreads();
-
-      float probability = 0.0f;
-      if (source_position < effective_src_len) {
-        probability = expf(score - row_new_max);
+        probability = expf(dot * inv_scale - row_max) / row_sum;
       }
       probabilities[threadIdx.x] = probability;
-      const float tile_sum = blockReduceSum(probability);
-      if (threadIdx.x == 0) {
-        row_sum = row_alpha * row_sum + tile_sum;
-        row_max = row_new_max;
-      }
       __syncthreads();
 
       for (int dimension = threadIdx.x; dimension < head_dim;
            dimension += blockDim.x) {
-        float tile_value = 0.0f;
+        float value = accumulator[dimension];
         for (int offset = 0; offset < kBlockSize; ++offset) {
           const int source = tile_start + offset;
           if (source >= effective_src_len) {
@@ -202,9 +220,9 @@ __global__ void attentionOnlineKernel(const T* q, const T* k, const T* v,
           const size_t v_offset =
               ((static_cast<size_t>(batch) * src_seq_len + source) * kv_heads +
                kv_head) * head_dim + dimension;
-          tile_value += probabilities[offset] * toFloat(v[v_offset]);
+          value += probabilities[offset] * toFloat(v[v_offset]);
         }
-        accumulator[dimension] = row_alpha * accumulator[dimension] + tile_value;
+        accumulator[dimension] = value;
       }
       __syncthreads();
     }
@@ -215,7 +233,7 @@ __global__ void attentionOnlineKernel(const T* q, const T* k, const T* v,
           ((static_cast<size_t>(batch) * target_seq_len + target_position) *
                query_heads + query_head) *
           head_dim + dimension;
-      output[output_index] = fromFloat<T>(accumulator[dimension] / row_sum);
+      output[output_index] = fromFloat<T>(accumulator[dimension]);
     }
     __syncthreads();
   }
