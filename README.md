@@ -67,8 +67,9 @@ output[i, j] = input[i, j] * rsqrt(mean_square + eps) * weight[j]
 在完成英伟达的基础上，可以将实现适配至天数、沐曦和/或摩尔这三款 GPU 平台上。
 
 - 天数适配需同样在 `src/kernels.cu` 中进行；
-- 沐曦适配需在 `src/kernels.maca` 中进行；
-- 摩尔适配需在 `src/kernels.mu` 中进行；
+- 沐曦适配对应仓库中的 `PLATFORM=metax`，实现文件为 `src/kernels.maca`；
+- 摩尔适配对应仓库中的 `PLATFORM=moore`，实现文件为 `src/kernels.mu`；
+- 其中本次项目约定：C500 使用 MetaX 路径，PH100（用户命名为 S5000）使用 Moore/MUSA 路径。
 
 具体编译和运行方式以及国产适配对评分的影响，分别可见下面的 **编译与运行** 与 **评分规则** 两部分。
 
